@@ -1,6 +1,6 @@
 # =============================================================================
 # - รันบน ArcGIS Pro Python environment (ต้องมี arcpy)
-# - Script v2 (ปรับปรุง 2025-10-28)
+# - Script v3 (ปรับปรุง 2025-10-28)
 # - ตรวจสอบความถูกต้องของข้อมูล GIS ใน GDB ตามมาตรฐานที่กำหนด
 # =============================================================================
 
@@ -58,14 +58,29 @@ def write_error_report(error_list, gdb_path, fc_name, check_type, oid, field, va
 def find_gdb_paths(root_dir):
     gdb_paths = []
     for root, dirs, _ in os.walk(root_dir):
+        
+        # 1. ค้นหา GDB ใน Dirs ปัจจุบัน
+        found_gdbs = []
         for d in dirs:
             if d.lower().endswith(".gdb"):
                 gdb_paths.append(os.path.join(root, d))
+                found_gdbs.append(d)
+
+        # 2. (สำคัญ) ลบ GDB ที่พบออกจาก Dirs
+        # เพื่อ os.walk จะได้ไม่ค้นหา *ข้างใน* GDB นั้นอีก (เจอบางจังหวัดที่มี GDB ซ้อนกัน)
+        # # (ต้องทำใน loop ย้อนกลับ หรือสร้าง list ใหม่ แต่ .remove() ก็ใช้ได้)
+        for gdb_dir in found_gdbs:
+            try:
+                dirs.remove(gdb_dir)
+            except ValueError:
+                pass # ไม่ควรเกิดขึ้น        
     if not gdb_paths:        
         print(f"คำเตือน: ไม่พบ .gdb ใน {root_dir}")
     else:
         print(f"พบ {len(gdb_paths)} GDB(s) สำหรับดำเนินการต่อ")
     return gdb_paths
+
+
 # *** ฟังก์ชันแปลง GDB Path ***
 def get_short_gdb_path(full_gdb_path):
     """
@@ -619,7 +634,7 @@ def validate_road(fc_path, error_list, basename=None):
 
 
                 # 3.1.1. STREET_NAME ต้องเป็น String ถ้า TD_RP3_TYPE_CODE เป็น 1 หรือ 2 หรือ 3 หรือ 4 หรือ 5 หรือ 6 หรือ 8 จะต้องไม่ใช่ค่าว่าง
-                # ดำเนินการในส่วนล่าง
+                is_street_name_empty = (name is None or (isinstance(name, str) and name.strip() == ""))
 
                 # 3.1.2. STREET_CODE ต้องเป็น String (เช็คจากประเภทข้อมูลแล้ว)
                 # 3.1.3. STREET_DEPTH ต้องเป็น Number (เช็คจากประเภทข้อมูลแล้ว)
@@ -1254,7 +1269,7 @@ def main():
         print(f"  !! ล้มเหลวในการเขียนไฟล์สรุป Excel: {e}")
         print("  !! (โปรดตรวจสอบว่าไฟล์ Excel ปิดอยู่ และคุณมีสิทธิ์เขียนทับ)")
 
-    print("\nValidation complete.")
+    print("\nเสร็จแล้วจ้า ดูผลลัพธ์ได้เลยจ้า")
 
 if __name__ == "__main__":
     main()
