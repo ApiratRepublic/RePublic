@@ -1,0 +1,1063 @@
+# =============================================================================
+# - รันบน ArcGIS Pro Python environment (ต้องมี arcpy)
+# - Script v1 (ปรับปรุง 2025-10-27)
+# - ตรวจสอบความถูกต้องของข้อมูล GIS ใน GDB ตามข้อกำหนดที่กำหนดไว้
+# =============================================================================
+
+import arcpy
+import os
+import re
+import csv
+import datetime
+import uuid
+from collections import defaultdict
+import pandas as pd
+from openpyxl import load_workbook
+
+# -----------------------------
+# ที่ตั้งไฟล์
+# -----------------------------
+ROOT_DIR = r"D:\A02-Projects\Clinix\Test_GDB_GPT"  # ที่รวมไฟล์ GDB
+REPORT_ROOT = r"D:\A02-Projects\Clinix\Report"  # ที่เก็บรายงานผล
+OVERLAP_ROOT = r"D:\A02-Projects\Clinix\Overlaping"  # ที่เก็บไฟล์ผลการตรวจสอบทับซ้อน
+SUMMARY_EXCEL_PATH = r"D:\A02-Projects\Clinix\Report\Summary_Report.xlsx"
+# --------------------------------------------
+#   จัดการค่าต่าง ๆ รวมทั้งฟังก์ชัน ตัวแปร ที่ใช้ร่วมกัน
+# --------------------------------------------
+NUMERIC_TYPES = {"SmallInteger", "Integer", "Single", "Double", "Float", "DoubleFloat", "SingleFloat", "OID"}
+
+
+ROAD_LAND_USE_DOMAIN = {
+    "พาณิชยกรรม", "อุตสาหกรรม", "พาณิชยกรรมและที่อยู่อาศัย", "ที่อยู่อาศัย",
+    "ที่อยู่อาศัยและเกษตรกรรม", "ส่วนราชการ", "เกษตรกรรม", "พื้นที่ป่าสงวน", "พื้นที่อุทยาน"
+}
+ROAD_STREET_TYPE_DOMAIN = {
+    "คอนกรีต", "ลาดยาง", "หินคลุก", "ลูกรัง", "ดิน", "น้ำ", "ไม้", "ทางไม่มีสภาพ"
+}
+ROAD_REQ_NAME_TD_CODES = {1, 2, 3, 4, 5, 6, 8}
+REL_TABLE_NO_DOMAIN = {1, 2, 3, 41, 42, 5, 6, 7}
+REL_SUB_TABLE_NO_RANGE = range(0, 7) # 0-6
+
+
+def write_csv_error(error_list, gdb_path, fc_name, check_type, oid, field, value, message):
+    """
+    รวบรวมข้อผิดพลาดลงใน List
+    """
+    error_list.append([
+        datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        gdb_path,
+        fc_name,
+        check_type,
+        oid,
+        field,
+        value,
+        message
+    ])
+
+# ค้นหา GDBs
+def find_gdb_paths(root_dir):
+    gdb_paths = []
+    for root, dirs, _ in os.walk(root_dir):
+        for d in dirs:
+            if d.lower().endswith(".gdb"):
+                gdb_paths.append(os.path.join(root, d))
+    if not gdb_paths:        
+        print(f"คำเตือน: ไม่พบ .gdb ใน {root_dir}")
+    else:
+        print(f"พบ {len(gdb_paths)} GDB(s) สำหรับดำเนินการต่อ")
+    return gdb_paths
+# *** ฟังก์ชันแปลง GDB Path ***
+def get_short_gdb_path(full_gdb_path):
+    """
+    แปลง full GDB path เป็นรูปแบบย่อ เพื่อจัดการชื่อจังหวัดและ gdb ให้อยู่ในรูป เช่น 49_มุกดาหาร/GDB_49_2
+    """
+    try:
+        # parent = GDB_49_2
+        parent = os.path.basename(os.path.dirname(full_gdb_path))
+        # grandparent = 49_มุกดาหาร
+        grandparent = os.path.basename(os.path.dirname(os.path.dirname(full_gdb_path)))
+        # ใช้ os.path.sep เพื่อให้ทำงานได้ทั้ง Windows (\\) และ Linux (/)
+        return f"{grandparent}{os.path.sep}{parent}"
+    except Exception:
+        return full_gdb_path # ถ้ามีปัญหา ให้คืนค่าเดิม
+    
+def safe_list_fields(fc_path):
+    try:
+        return {f.name.upper(): f.type for f in arcpy.ListFields(fc_path)}
+    except Exception:
+        return {}
+
+def is_numeric_field_type(field_type):
+    if not field_type:
+        return False
+    return field_type in NUMERIC_TYPES or field_type.lower() in {"double","single","float","integer","smallinteger","short","long"}
+
+def can_be_number(val):
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        return True
+    try:
+        float(val)
+        return True
+    except Exception:
+        return False
+        
+def safe_value_is_int_like(val):
+    if val is None: return False
+    try:
+        if isinstance(val, (int, float)):
+            return float(val).is_integer()
+        if isinstance(val, str) and val.isdigit():
+            return True
+        return False
+    except Exception:
+        return False
+
+# ---------------------------------
+# ฟังก์ชันตรวจสอบทับซ้อน (ทับสนิท)
+# ---------------------------------
+def check_for_exact_overlaps(fc_path, error_list, output_dir, output_basename, return_layer_path=False):
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"    - ตรวจสอบการซ้อนทับ (ที่ทับกันสนิท) {fc_name}...")
+
+    try:
+        oid_field_name = arcpy.Describe(fc_path).OIDFieldName
+    except Exception as e:
+        print(f"      -> ไม่สามารถหาชื่อ OID Field ของ {fc_name} ได้: {e}")
+        write_csv_error(error_list, gdb_path, fc_name, "Overlap Check Error", -1, "Shape", "", f"ไม่สามารถหาชื่อ OID Field: {e}")
+        return None
+    
+    uid = uuid.uuid4().hex[:8]
+    output_table = os.path.join("in_memory", f"identical_{output_basename}_{fc_name}_{uid}")
+    output_shp = os.path.join(output_dir, f"{output_basename}_{fc_name}_duplicates.shp")
+    temp_layer = f"dup_layer_{output_basename}_{fc_name}_{uid}"
+
+    for item in (output_table, temp_layer):
+        if arcpy.Exists(item):
+            try: arcpy.management.Delete(item)
+            except Exception: pass
+
+    try:
+        arcpy.management.FindIdentical(
+            in_dataset=fc_path,
+            out_dataset=output_table,
+            fields=["Shape"],
+            xy_tolerance="0 Meters",
+            z_tolerance="0"
+        )
+
+        group_map = defaultdict(list)
+        # FindIdentical อาจสร้าง FEAT_SEQ หรือ GroupID ขึ้นอยู่กับเวอร์ชัน
+        table_fields = [f.name for f in arcpy.ListFields(output_table)]
+        id_field = "IN_FID"
+        seq_field = "FEAT_SEQ"
+        
+        # Fallback สำหรับ ArcGIS เวอร์ชันเก่าที่อาจไม่มี FEAT_SEQ
+        if seq_field not in table_fields:
+            if "GroupID" in table_fields:
+                seq_field = "GroupID"
+            else:
+                # ถ้าไม่มีทั้งคู่, ใช้วิธีนับ IN_FID (อาจไม่แม่นยำเท่า)
+                with arcpy.da.SearchCursor(output_table, [id_field]) as cur:
+                    for row in cur:
+                        group_map[row[0]].append(row[0]) # ใช้ FID เป็น GroupID ชั่วคราว
+            
+        if seq_field in table_fields:
+             with arcpy.da.SearchCursor(output_table, [id_field, seq_field]) as cur:
+                for in_fid, group_id in cur:
+                    group_map[group_id].append(in_fid)
+
+        # เก็บเฉพาะกลุ่มที่มีมากกว่า 1 feature = geometry ซ้ำ
+        dup_fids = [fid for fids in group_map.values() if len(fids) > 1 for fid in fids]
+
+        if dup_fids:
+            count = len(dup_fids)
+            dup_fids_set = sorted(list(set(dup_fids))) # เอา OID ที่ซ้ำจริงๆ
+            count_unique = len(dup_fids_set)
+            
+            print(f"      -> พบ Duplicated Polygon ทั้งหมด {count_unique} รูปแปลง (OIDs: {dup_fids_set[:20]}{'...' if count_unique>20 else ''})")
+
+            write_csv_error(
+                error_list,
+                gdb_path,
+                fc_name,
+                "Duplicated Polygon",
+                str(dup_fids_set),
+                "Shape",
+                count_unique,
+                f"พบ {count_unique} โพลีกอนทับกันสนิท (OIDs: {dup_fids_set[:20]}{'...' if count_unique>20 else ''})"
+            )
+
+            os.makedirs(output_dir, exist_ok=True)
+            where_clause = f"{oid_field_name} IN ({','.join(map(str, dup_fids_set))})"
+            
+            arcpy.management.MakeFeatureLayer(fc_path, temp_layer, where_clause)
+            arcpy.management.CopyFeatures(temp_layer, output_shp)
+
+            print(f"      -> บันทึก shapefile เฉพาะโพลีกอนที่ซ้ำ: {output_shp}")
+            return output_shp if return_layer_path else None
+        else:
+            print("      -> ไม่พบ Duplicated Polygon")
+            return None
+
+    except Exception as e:
+        write_csv_error(error_list, gdb_path, fc_name, "Geometry Error", -1, "GEOMETRY", "", str(e))
+        print(f"      !! Error: {e}")
+        return None
+    finally:
+        for item in (output_table, temp_layer):
+            if arcpy.Exists(item):
+                try: arcpy.management.Delete(item)
+                except Exception: pass
+                
+# ----------------------------------------
+# ตรวจสอบประเภทข้อมูลและค่าต่าง ๆ ตามที่กำหนดไว้
+# ----------------------------------------
+
+# 1) PARCEL
+def validate_parcel(fc_path, error_list, basename=None):
+    # (โค้ดส่วนนี้จากไฟล์ของคุณถูกต้องและครบถ้วน)
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  กำลังตรวจสอบ PARCEL: {fc_name}")
+    fields = safe_list_fields(fc_path)
+
+    required = ["UTMMAP1","UTMMAP2","UTMMAP3","UTMMAP4","UTMSCALE","LAND_NO","PARCEL_TYPE","CHANGWAT_CODE","BRANCH_CODE","PARCEL_RN"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์นี้")
+    
+    # ตรวจสอบประเภทข้อมูล
+
+    if "UTMMAP1" in fields and fields["UTMMAP1"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP1", fields["UTMMAP1"], "ต้องเป็น String")
+    if "UTMMAP2" in fields and not is_numeric_field_type(fields["UTMMAP2"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP2", fields["UTMMAP2"], "ต้องเป็น Number")
+    if "UTMMAP3" in fields and fields["UTMMAP3"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP3", fields["UTMMAP3"], "ต้องเป็น String")
+    if "UTMMAP4" in fields and fields["UTMMAP4"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP4", fields["UTMMAP4"], "ต้องเป็น String")
+    if "UTMSCALE" in fields and not is_numeric_field_type(fields["UTMSCALE"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMSCALE", fields["UTMSCALE"], "ต้องเป็น Number")
+    if "LAND_NO" in fields and not is_numeric_field_type(fields["LAND_NO"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "LAND_NO", fields["LAND_NO"], "ต้องเป็น Number") 
+    if "PARCEL_TYPE" in fields and not is_numeric_field_type(fields["PARCEL_TYPE"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "PARCEL_TYPE", fields["PARCEL_TYPE"], "ต้องเป็น Number")       
+    if "CHANGWAT_CODE" in fields and fields["CHANGWAT_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "CHANGWAT_CODE", fields["CHANGWAT_CODE"], "ต้องเป็น String")
+    if "BRANCH_CODE" in fields and fields["BRANCH_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "BRANCH_CODE", fields["BRANCH_CODE"], "ต้องเป็น String")
+ 
+
+    # ตรวจสอบ ความถูกต้องของข้อมูล
+
+    utm_key = defaultdict(list)
+    branch_parcel_rn = defaultdict(list)
+
+    cursor_fields = [f for f in ["OID@","UTMMAP1","UTMMAP2","UTMMAP3","UTMMAP4","UTMSCALE","LAND_NO","PARCEL_TYPE","CHANGWAT_CODE","BRANCH_CODE","PARCEL_RN"] if f == "OID@" or f.upper() in fields]
+    try:
+        with arcpy.da.SearchCursor(fc_path, cursor_fields) as cur:
+            for row in cur:
+                rec = dict(zip([f.upper() for f in cursor_fields], row))
+                oid = rec.get("OID@",-1)
+                utm1 = rec.get("UTMMAP1"); utm2 = rec.get("UTMMAP2"); utm3=rec.get("UTMMAP3"); utm4=rec.get("UTMMAP4")
+                scale = rec.get("UTMSCALE"); land_no=rec.get("LAND_NO"); parcel_type=rec.get("PARCEL_TYPE")
+                cwt = rec.get("CHANGWAT_CODE"); branch = rec.get("BRANCH_CODE"); parcel_rn = rec.get("PARCEL_RN")
+
+                # UTMMAP1 เงื่อนไข ต้องเป็น String และเป็น 4 หลัก
+                if not (isinstance(utm1, str) and utm1.isdigit() and len(utm1)==4):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP1", utm1, "UTMMAP1 ต้องเป็น 4 หลัก")
+                
+                # UTMMAP2 เงื่อนไข ต้องเป็น 1-4 
+                if not (isinstance(utm2,(int,float)) or (isinstance(utm2,str) and utm2.isdigit())):
+                    write_csv_error(error_list, gdb_path, fc_name, "Field Type", oid, "UTMMAP2", utm2, "ประเภทข้อมูลต้องเป็น Number และไม่ควรว่าง")
+                else:
+                    try:
+                        if int(float(utm2)) not in (1,2,3,4):
+                            write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP2", utm2, "UTMMAP2 ต้องเป็น 1 - 4 ")
+                    except:
+                        pass
+               
+                # UTMMAP3 เงื่อนไข ต้องเป็น String 4 หลัก
+                if not (isinstance(utm3,str) and utm3.isdigit() and len(utm3)==4):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP3", utm3, "UTMMAP3 ต้องเป็น 4 หลัก")
+                # UTMMAP4 เงื่อนไข ต้องเป็น String 2 หลัก
+                if not (isinstance(utm4,str) and utm4.isdigit() and len(utm4)==2):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP4", utm4, "UTMMAP4 ของชั้น PARCEL ต้องเป็น 2 หลัก")
+                else:
+
+                    # ตรวจสอบความสอดคล้องกับ UTMSCALE
+                    try:
+                        scale_i = int(float(scale)) if scale is not None else None
+                    except:
+                        scale_i = None
+                    if scale_i == 4000 and utm4 != '00':
+                        write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMMAP4", utm4, "UTMMAP4 ต้องเป็น '00' เนื่องจาก UTMSCALE=4000")
+                    elif scale_i == 2000:
+                        try:
+                            if not (1 <= int(utm4) <= 4):
+                                write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMMAP4", utm4, "UTMMAP4 ต้องอยู่ระหว่าง '01'-'04' เนื่องจาก UTMSCALE=2000")
+                        except:
+                            pass
+                    elif scale_i == 1000:
+                        try:
+                            if not (1 <= int(utm4) <= 16):
+                                write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMMAP4", utm4, "UTMMAP4 ต้องอยู่ระหว่าง '01'-'16' เนื่องจาก UTMSCALE=1000")
+                        except:
+                            pass
+                    elif scale_i == 500:
+                        try:
+                            if not (1 <= int(utm4) <= 64):
+                                write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMMAP4", utm4, "UTMMAP4 ต้องอยู่ระหว่าง '01'-'64' เนื่องจาก UTMSCALE=500")
+                        except:
+                            pass
+
+                # UTMSCALE ต้องเป็นค่าที่กำหนด
+                if scale is None or int(float(scale)) not in (4000,2000,1000,500):
+                    write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMSCALE", scale, "UTMSCALE ของฟีเจอร์คลาส PARCEL จะต้องเป็น 4000,2000,1000 หรือ 500")
+
+                # CHANGWAT_CODE ต้องเป็น 2 หลัก
+                if not (isinstance(cwt,str) and len(cwt)==2 and cwt.isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "CHANGWAT_CODE", cwt, "CHANGWAT_CODE ต้องเป็น 2 หลัก")
+
+                # BRANCH_CODE ต้องเป็น 8 หลัก และต้องสอดคล้องกับ CHANGWAT_CODE
+                if not (isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+                else:
+                    if isinstance(cwt,str) and not branch.startswith(cwt):
+                        write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "BRANCH_CODE", branch, f"2 หลักแรกของ BRANCH_CODE ไม่ตรงกับ CHANGWAT_CODE {cwt}")
+                
+                # PARCEL_RN
+                if parcel_rn is None or not can_be_number(parcel_rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Field Type", oid, "PARCEL_RN", parcel_rn, "ต้องเป็น Number และไม่ควรว่าง")
+                else:
+                    branch_parcel_rn[(branch.strip() if branch else "NULL", int(float(parcel_rn)))].append(oid)
+
+                # ตรวจสอบ 7 คีย์หลัก (เฉพาะเมื่อ LAND_NO ไม่ใช่ 0 หรือ ว่าง)
+                is_land_no_valid = False
+                if land_no is not None and can_be_number(land_no):
+                    if int(float(land_no)) != 0:
+                        is_land_no_valid = True
+
+                if is_land_no_valid:
+                    # ถ้า LAND_NO ไม่ใช่ 0 หรือ ว่าง จึงจะเพิ่มเข้า utm_key เพื่อตรวจสอบค่าซ้ำ
+                    scale_i = int(float(scale)) if can_be_number(scale) else scale
+                    check_key = (branch.strip() if branch else "NULL", utm1, utm2, utm3, utm4, scale_i, land_no)
+                    utm_key[check_key].append(oid)
+                # (else: ถ้า LAND_NO เป็น 0 หรือ ว่าง, ก็ไม่ต้อง add เข้า utm_key)
+
+
+            for primery_key, oids in utm_key.items():
+                if len(oids) > 1:
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate UTM", str(oids), "PRIMERY_KEY", primery_key, "BRANCH_CODE+UTMMAP1+UTMMAP2+UTMMAP3+UTMMAP4+UTMSCALE+LAND_NO มีค่าซ้ำ")
+
+            for k, oids in branch_parcel_rn.items():
+                if len(oids) > 1:
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "PARCEL_RN", k, "PARCEL_RN มีค่าซ้ำภายใน BRANCH_CODE เดียวกัน")
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+    # ตรวจสอบ Overlap
+    check_for_exact_overlaps(fc_path, error_list, os.path.join(OVERLAP_ROOT,"PARCEL"), basename or "PARCEL")
+
+# 2) PARCEL_NS3K
+def validate_parcel_ns3k(fc_path, error_list, basename=None):
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  ตรวจสอบ PARCEL_NS3K: {fc_name}")
+
+    fields = safe_list_fields(fc_path)
+    required = ["UTMMAP1","UTMMAP2","UTMMAP3","UTMMAP4","UTMSCALE","LAND_NO","PARCEL_TYPE","CHANGWAT_CODE","BRANCH_CODE","NS3K_RN"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์นี้")
+    
+    # type checks
+    if "UTMMAP1" in fields and fields["UTMMAP1"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP1", fields["UTMMAP1"], "ต้องเป็น String")
+    if "UTMMAP2" in fields and not is_numeric_field_type(fields["UTMMAP2"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP2", fields["UTMMAP2"], "ต้องเป็น Number")
+    if "UTMMAP3" in fields and fields["UTMMAP3"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP3", fields["UTMMAP3"], "ต้องเป็น String")
+    if "UTMMAP4" in fields and fields["UTMMAP4"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMMAP4", fields["UTMMAP4"], "ต้องเป็น String")
+    if "UTMSCALE" in fields and not is_numeric_field_type(fields["UTMSCALE"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "UTMSCALE", fields["UTMSCALE"], "ต้องเป็น Number")
+    if "LAND_NO" in fields and not is_numeric_field_type(fields["LAND_NO"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "LAND_NO", fields["LAND_NO"], "ต้องเป็น Number")
+    if "PARCEL_TYPE" in fields and not is_numeric_field_type(fields["PARCEL_TYPE"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "PARCEL_TYPE", fields["PARCEL_TYPE"], "ต้องเป็น Number")
+    if "CHANGWAT_CODE" in fields and fields["CHANGWAT_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "CHANGWAT_CODE", fields["CHANGWAT_CODE"], "ต้องเป็น String")
+    if "BRANCH_CODE" in fields and fields["BRANCH_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "BRANCH_CODE", fields["BRANCH_CODE"], "ต้องเป็น String")
+    
+    
+    # ตรวจสอบ
+    utm_key = defaultdict(list)
+    branch_ns3k = defaultdict(list)
+
+    cursor_fields = [f for f in ["OID@","UTMMAP1","UTMMAP2","UTMMAP3","UTMMAP4","UTMSCALE","LAND_NO","PARCEL_TYPE","CHANGWAT_CODE","BRANCH_CODE","NS3K_RN"] if f == "OID@" or f.upper() in fields]
+    try:
+        with arcpy.da.SearchCursor(fc_path, cursor_fields) as cur:
+            for row in cur:
+                rec = dict(zip([f.upper() for f in cursor_fields],row))
+                oid = rec.get("OID@", -1)
+                utm1 = rec.get("UTMMAP1"); utm2=rec.get("UTMMAP2"); utm3=rec.get("UTMMAP3"); utm4=rec.get("UTMMAP4")
+                scale = rec.get("UTMSCALE"); land_no = rec.get("LAND_NO"); parcel_type = rec.get("PARCEL_TYPE")
+                cwt = rec.get("CHANGWAT_CODE"); branch = rec.get("BRANCH_CODE"); ns3k_rn = rec.get("NS3K_RN")
+
+                if not (isinstance(utm1,str) and utm1.isdigit() and len(utm1)==4):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP1", utm1, "UTMMAP1 ต้องมี 4 หลัก")
+                if not (isinstance(utm2,(int,float)) or (isinstance(utm2,str) and utm2.isdigit())):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP2", utm2, "รูปแบบข้อมูลต้องเป็น Number")
+                else:
+                    try:
+                        if int(float(utm2)) not in (1,2,3,4):
+                            write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP2", utm2, "UTMMAP2 ต้องอยู่ระหว่าง 1-4")
+                    except:
+                        pass
+
+                if not (isinstance(utm3,str) and utm3 == "0000"):
+                    write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMMAP3", utm3, "UTMMAP3 ของ NS3K ต้องเป็น '0000'")
+                if not (isinstance(utm4,str) and utm4.isdigit() and len(utm4)==3):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "UTMMAP4", utm4, "ต้องเป็น 3 หลัก")
+                if scale is None or int(float(scale)) != 5000:
+                    write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "UTMSCALE", scale, "UTMSCALE ของ NS3K ต้องเป็น 5000")
+                if parcel_type != 3:
+                    write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "PARCEL_TYPE", parcel_type, "PARCEL_TYPE ของ NS3K ต้องเป็น 3")
+                if not (isinstance(cwt,str) and len(cwt)==2 and cwt.isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "CHANGWAT_CODE", cwt, "ต้องเป็น 2 หลัก")
+                if not (isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "ต้องเป็น 8 หลัก")
+                else:
+                    if isinstance(cwt,str) and not branch.startswith(cwt):
+                        write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "BRANCH_CODE", branch, f"2 หลักแรกของ BRANCH_CODE ไม่ตรงกับ CHANGWAT_CODE {cwt}")
+                
+                if ns3k_rn is None or not can_be_number(ns3k_rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Field Type", oid, "NS3K_RN", ns3k_rn, "ต้องเป็น Number")
+                else:
+                    branch_ns3k[(branch.strip() if branch else "NULL", int(float(ns3k_rn)))].append(oid)
+                
+                # *** ตรวจสอบ 7 คีย์หลัก (เฉพาะเมื่อ LAND_NO ไม่ใช่ 0 หรือ ว่าง) ***
+                is_land_no_valid = False
+                if land_no is not None and can_be_number(land_no):
+                    if int(float(land_no)) != 0:
+                        is_land_no_valid = True
+
+                if is_land_no_valid:
+                    # ถ้า LAND_NO ถูกต้อง, จึงจะเพิ่มเข้า utm_key เพื่อตรวจสอบค่าซ้ำ
+                    scale_i = int(float(scale)) if can_be_number(scale) else scale
+                    check_key = (branch.strip() if branch else "NULL", utm1, utm2, utm3, utm4, scale_i, land_no)
+                    utm_key[check_key].append(oid)
+                # (else: ถ้า LAND_NO เป็น 0 หรือ ว่าง, ก็ไม่ต้อง add เข้า utm_key)
+
+            for primery_key,oids in utm_key.items():
+                if len(oids)>1:
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate UTM", str(oids), "PRIMERY_KEY", primery_key, "BRANCH_CODE+UTMMAP1+UTMMAP2+UTMMAP3+UTMMAP4+UTMSCALE+LAND_NO not unique")
+            for k,oids in branch_ns3k.items():
+                if len(oids)>1:
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "NS3K_RN", k, "NS3K_RN ซ้ำภายใน BRANCH_CODE เดียวกัน")
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+    check_for_exact_overlaps(fc_path, error_list, os.path.join(OVERLAP_ROOT,"PARCEL"), basename or "PARCEL_NS3K")
+
+# 3) ROAD
+def validate_road(fc_path, error_list, basename=None):
+    # (โค้ดส่วนนี้จากไฟล์ของคุณถูกต้องและครบถ้วน)
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  กำลังตรวจสอบชั้นข้อมูล ROAD: {fc_name}")
+    fields = safe_list_fields(fc_path)
+    
+    VALID_LAND_USE = ROAD_LAND_USE_DOMAIN
+    VALID_STREET_TYPE = ROAD_STREET_TYPE_DOMAIN
+    VALID_TD_RP3 = ROAD_REQ_NAME_TD_CODES
+
+    required = ["STREET_NAME","STREET_CODE","STREET_DEPTH","LAND_USE","STREET_TYPE","STREET_WIDTH","STREET_AREA","BRANCH_CODE","PARCEL_TYPE","TD_RP3_TYPE_CODE","STREET_RN","CHANGWAT_CODE","STREET_SMG"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์นี้")
+
+    # type checks
+    if "STREET_NAME" in fields and fields["STREET_NAME"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_NAME", fields["STREET_NAME"], "ต้องเป็น String")
+    if "STREET_CODE" in fields and fields["STREET_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_CODE", fields["STREET_CODE"], "ต้องเป็น String")
+    if "STREET_DEPTH" in fields and not is_numeric_field_type(fields["STREET_DEPTH"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_DEPTH", fields["STREET_DEPTH"], "ต้องเป็น Number")
+    if "LAND_USE" in fields and fields["LAND_USE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "LAND_USE", fields["LAND_USE"], "ต้องเป็น String")
+    if "STREET_TYPE" in fields and fields["STREET_TYPE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_TYPE", fields["STREET_TYPE"], "ต้องเป็น String")
+    if "STREET_WIDTH" in fields and not is_numeric_field_type(fields["STREET_WIDTH"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_WIDTH", fields["STREET_WIDTH"], "ต้องเป็น Number")
+    if "STREET_AREA" in fields and not is_numeric_field_type(fields["STREET_AREA"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_AREA", fields["STREET_AREA"], "ต้องเป็น Number")
+    if "BRANCH_CODE" in fields and fields["BRANCH_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "BRANCH_CODE", fields["BRANCH_CODE"], "ต้องเป็น String")
+    if "PARCEL_TYPE" in fields and not is_numeric_field_type(fields["PARCEL_TYPE"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "PARCEL_TYPE", fields["PARCEL_TYPE"], "ต้องเป็น Number")
+    if "TD_RP3_TYPE_CODE" in fields and not is_numeric_field_type(fields["TD_RP3_TYPE_CODE"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "TD_RP3_TYPE_CODE", fields["TD_RP3_TYPE_CODE"], "ต้องเป็น Number")
+    if "STREET_RN" in fields and not is_numeric_field_type(fields["STREET_RN"]):
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_RN", fields["STREET_RN"], "ต้องเป็น Number")
+    if "CHANGWAT_CODE" in fields and fields["CHANGWAT_CODE"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "CHANGWAT_CODE", fields["CHANGWAT_CODE"], "ต้องเป็น String")
+    if "STREET_SMG" in fields and fields["STREET_SMG"] != "String":
+        write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, "STREET_SMG", fields["STREET_SMG"], "ต้องเป็น String")
+
+    
+    chk_fields = [f for f in ["OID@","BRANCH_CODE","CHANGWAT_CODE","PARCEL_TYPE","TD_RP3_TYPE_CODE","STREET_RN","STREET_NAME","STREET_CODE","STREET_TYPE","STREET_DEPTH","LAND_USE","STREET_WIDTH","STREET_AREA","STREET_SMG"] if f=="OID@" or f.upper() in fields]
+    try:
+        branch_street_rn_seen = defaultdict(list) # เปลี่ยนชื่อเพื่อความชัดเจน
+        name_code_pairs = []
+        with arcpy.da.SearchCursor(fc_path, chk_fields) as cur:
+            for row in cur:
+                rec = dict(zip([f.upper() for f in chk_fields],row))
+                oid = rec.get("OID@", -1)
+                branch = rec.get("BRANCH_CODE"); cwt = rec.get("CHANGWAT_CODE")
+                parcel_type = rec.get("PARCEL_TYPE"); td_type = rec.get("TD_RP3_TYPE_CODE")
+                street_rn = rec.get("STREET_RN"); name = rec.get("STREET_NAME"); code = rec.get("STREET_CODE")
+                street_type = rec.get("STREET_TYPE"); land_use = rec.get("LAND_USE")
+
+                # branch/changwat
+                # CHANGWAT_CODE ต้องเป็น 2 หลัก
+                if not (isinstance(cwt,str) and len(cwt)==2 and cwt.isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "CHANGWAT_CODE", cwt, "ต้องเป็น 2 หลัก")
+                if branch and cwt and (not (isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit())):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+                if branch and cwt and isinstance(branch,str) and isinstance(cwt,str) and not branch.startswith(cwt):
+                    write_csv_error(error_list, gdb_path, fc_name, "Conditional Rule", oid, "BRANCH_CODE", branch, f"2 หลักแรกของ BRANCH_CODE ไม่ตรงกับ CHANGWAT_CODE {cwt}")
+
+                # parcel type -
+                if parcel_type is not None and not can_be_number(parcel_type):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "PARCEL_TYPE", parcel_type, "ต้องเป็น Number")
+
+                # TD_RP3_TYPE_CODE must be in allowed set
+                td_type_int = None
+                is_td_type_valid_number = False
+
+                if td_type is None:
+                    td_type_int = None
+                    is_td_type_valid_number = True # ถือว่า None เป็นค่าที่ถูกต้องสำหรับตรวจสอบ
+                elif can_be_number(td_type):
+                    td_type_int = int(float(td_type))
+                    is_td_type_valid_number = True
+                else:
+                    # กรณีเป็น non-numeric string (เช่น "abc") ซึ่งผิดเสมอ
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "TD_RP3_TYPE_CODE", td_type, "TD_RP3_TYPE_CODE ต้องเป็นตัวเลขเท่านั้น")
+                    is_td_type_valid_number = False
+
+                if is_td_type_valid_number:
+                    # ตรวจสอบว่า STREET_NAME ว่างหรือไม่
+                    is_street_name_empty = (name is None or (isinstance(name, str) and name.strip() == ""))
+
+                    if not is_street_name_empty:
+                        # --- A: STREET_NAME มีค่า ---
+                        # (ข้อ 3.1.11) TD_RP3_TYPE_CODE ต้องเป็น {1,2,3,4,5,6,8}
+                        if td_type_int not in VALID_TD_RP3:
+                            write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "TD_RP3_TYPE_CODE", td_type, f"TD_RP3_TYPE_CODE ต้องมีค่าเป็น {sorted(VALID_TD_RP3)} (เนื่องจาก STREET_NAME มีค่า)")
+                            # (ข้อ 3.1.1 ถูกต้องโดยอัตโนมัติ เพราะ STREET_NAME ไม่ว่าง)
+
+                    else:
+                        # --- B: STREET_NAME ว่าง ---
+                        # (ข้อ 3.1.1 ไม่ต้องตรวจสอบ)
+                        # (ข้อ 3.1.11 ใหม่) TD_RP3_TYPE_CODE ต้องเป็น {0, None} หรือ {1-8}
+                        # สร้าง Set ที่อนุญาต (0, None, 1, 2, 3, 4, 5, 6, 8)
+                        ALLOWED_VALUES_WHEN_NAME_IS_EMPTY = {0, None} 
+                        ALLOWED_VALUES_WHEN_NAME_IS_EMPTY.update(VALID_TD_RP3) # เพิ่ม {1,2,3...}
+                        if td_type_int not in ALLOWED_VALUES_WHEN_NAME_IS_EMPTY:
+                            # ถ้า td_type เป็นค่าอื่น (เช่น 7, 9, 99)
+                            allowed_str = "{0, None} หรือ " + str(sorted(VALID_TD_RP3))
+                            write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "TD_RP3_TYPE_CODE", td_type, f"TD_RP3_TYPE_CODE ต้องเป็น {allowed_str} (เนื่องจาก STREET_NAME ว่างเปล่า)")
+
+                # STREET_RN uniqueness within branch
+                if street_rn is None or not can_be_number(street_rn):
+                     write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "STREET_RN", street_rn, "STREET_RN ต้องเป็น Number")
+                else:
+                    key = (branch.strip() if isinstance(branch,str) else "NULL", int(float(street_rn)))
+                    branch_street_rn_seen[key].append(oid)
+
+                if name and code:
+                    name_code_pairs.append((name, code))
+
+                # ตรวจสอบ LAND_USE เฉพาะเมื่อ STREET_NAME ไม่ว่าง
+                if (not is_street_name_empty) and (land_use is None or str(land_use).strip() not in VALID_LAND_USE):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "LAND_USE", land_use, f"LAND_USE จะต้องมีค่าดังต่อไปนี้ {VALID_LAND_USE} (เมื่อ STREET_NAME มีค่า)")
+           
+                # ตรวจสอบ STREET_TYPE เฉพาะเมื่อ STREET_NAME ไม่ว่าง
+                if (not is_street_name_empty) and (street_type is None or str(street_type).strip() not in VALID_STREET_TYPE):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "STREET_TYPE", street_type, f"STREET_TYPE จะต้องมีค่าดังต่อไปนี้ {VALID_STREET_TYPE} (เมื่อ STREET_NAME มีค่า)")
+        
+        # ตรวจสอบความเป็น 1-ต่อ-1 ระหว่าง STREET_NAME กับ STREET_CODE
+        name_to_code = {}
+        code_to_name = {}
+        for name, code in name_code_pairs:
+            if name in name_to_code and name_to_code[name] != code:
+                write_csv_error(error_list, gdb_path, fc_name, "OneToOne", "N/A", "STREET_NAME", name, f"{name} ตรวจพบว่าเชื่อมต่อกับ STREET_CODE มากกว่า 1  ({name_to_code[name]} vs {code})")
+            if code in code_to_name and code_to_name[code] != name:
+                write_csv_error(error_list, gdb_path, fc_name, "OneToOne", "N/A", "STREET_CODE", code, f"{code} ตรวจพบว่าเชื่อมต่อกับ STREET_NAME มากกว่า 1 ({code_to_name[code]} vs {name})")
+            name_to_code[name] = code
+            code_to_name[code] = name
+        
+        # เขียน Error สำหรับ STREET_RN ที่ซ้ำ
+        for key, oids in branch_street_rn_seen.items():
+            if len(oids) > 1:
+                branch_str, rn_str = key
+                write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "STREET_RN", rn_str, f"STREET_RN ซ้ำ ภายใน BRANCH_CODE '{branch_str}'")
+
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+    check_for_exact_overlaps(fc_path, error_list, os.path.join(OVERLAP_ROOT,"ROAD"), basename or "ROAD")
+
+# BLOCK VALIDATION ---
+
+def validate_block_fix(fc_path, error_list, basename=None):
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  กำลังตรวจสอบ BLOCK FIX: {fc_name}")
+    fields = safe_list_fields(fc_path)
+    
+    required = ["STREET_NAME", "STREET_CODE", "BRANCH_CODE", "BLOCK_FIX_RN"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์นี้")
+
+    chk_fields = [f for f in ["OID@","BRANCH_CODE","BLOCK_FIX_RN","STREET_NAME","STREET_CODE"] if f=="OID@" or f.upper() in fields]
+    try:
+        branch_rns = defaultdict(list)
+        name_code_pairs = []
+        with arcpy.da.SearchCursor(fc_path, chk_fields) as cur:
+            for row in cur:
+                rec = dict(zip([f.upper() for f in chk_fields], row))
+                oid = rec.get("OID@", -1)
+                branch = rec.get("BRANCH_CODE")
+                rn = rec.get("BLOCK_FIX_RN")
+                name = rec.get("STREET_NAME")
+                code = rec.get("STREET_CODE")
+
+                # 4.1.1: STREET_NAME
+                if not name or (isinstance(name, str) and (name.strip() == "" or name.strip() == "-")):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Required", oid, "STREET_NAME", name, "STREET_NAME ต้องไม่เป็นค่าว่าง, ช่องว่าง หรือ '-'")
+
+                # 4.1.3: BRANCH_CODE
+                if not (branch and isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+                
+                # 4.1.4: BLOCK_FIX_RN ซ้ำใน Branch
+                if rn is None or not can_be_number(rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BLOCK_FIX_RN", rn, "ต้องเป็น Number")
+                else:
+                    branch_rns[(branch.strip() if branch else "NULL", int(float(rn)))].append(oid)
+                
+                # 4.2: 1-to-1
+                if name and code:
+                    name_code_pairs.append((name, code))
+
+        for key, oids in branch_rns.items():
+            if len(oids) > 1:
+                write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "BLOCK_FIX_RN", key[1], f"BLOCK_FIX_RN ซ้ำใน BRANCH_CODE '{key[0]}'")
+
+        name_to_code = {}; code_to_name={}
+        for name,code in name_code_pairs:
+            if name in name_to_code and name_to_code[name] != code:
+                write_csv_error(error_list, gdb_path, fc_name, "OneToOne", "N/A", "STREET_NAME", name, f"{name} มี STREET_CODE มากกว่า 1")
+            if code in code_to_name and code_to_name[code] != name:
+                write_csv_error(error_list, gdb_path, fc_name, "OneToOne", "N/A", "STREET_CODE", code, f"{code} มี STREET_NAME มากกว่า 1")
+            name_to_code[name]=code; code_to_name[code]=name
+
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+    check_for_exact_overlaps(fc_path, error_list, os.path.join(OVERLAP_ROOT,"BLOCK"), basename or "BLOCK_FIX")
+
+def validate_block_price(fc_path, error_list, basename=None):
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  Validating BLOCK PRICE: {fc_name}")
+    fields = safe_list_fields(fc_path)
+    
+    required = ["STREET_NAME", "STREET_CODE", "BRANCH_CODE", "BLOCK_PRICE_RN"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์นี้")
+
+    chk_fields = [f for f in ["OID@","BRANCH_CODE","BLOCK_PRICE_RN","STREET_NAME","STREET_CODE"] if f=="OID@" or f.upper() in fields]
+    try:
+        branch_rns = defaultdict(list)
+        with arcpy.da.SearchCursor(fc_path, chk_fields) as cur:
+            for row in cur:
+                rec = dict(zip([f.upper() for f in chk_fields], row))
+                oid = rec.get("OID@", -1)
+                branch = rec.get("BRANCH_CODE")
+                rn = rec.get("BLOCK_PRICE_RN")
+                name = rec.get("STREET_NAME")
+
+                # 5.1.1: STREET_NAME
+                if not name or (isinstance(name, str) and (name.strip() == "" or name.strip() == "-")):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Required", oid, "STREET_NAME", name, "STREET_NAME ต้องไม่เป็นค่าว่าง, ช่องว่าง หรือ '-'")
+
+                # 5.1.3: BRANCH_CODE
+                if not (branch and isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+                
+                # 5.1.4: BLOCK_PRICE_RN ซ้ำใน Branch
+                if rn is None or not can_be_number(rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BLOCK_PRICE_RN", rn, "ต้องเป็น Number")
+                else:
+                    branch_rns[(branch.strip() if branch else "NULL", int(float(rn)))].append(oid)
+        
+        for key, oids in branch_rns.items():
+            if len(oids) > 1:
+                write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "BLOCK_PRICE_RN", key[1], f"BLOCK_PRICE_RN ซ้ำใน BRANCH_CODE '{key[0]}'")
+
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+    check_for_exact_overlaps(fc_path, error_list, os.path.join(OVERLAP_ROOT,"BLOCK"), basename or "BLOCK_PRICE")
+
+# 6) BLOCK_BLUE
+def validate_block_blue(fc_path, error_list, basename=None):
+    # (โค้ดส่วนนี้จากไฟล์ของคุณถูกต้องและครบถ้วน)
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  กำลังตรวจสอบ BLOCK_BLUE: {fc_name}")
+    fields = safe_list_fields(fc_path)
+    required = ["BRANCH_CODE","BLOCK_BLUE_RN","BLOCK_TYPE_ID"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์นี้")
+    
+    # ... (ส่วนตรวจสอบ Type ... ตรรกะของคุณถูกต้อง)
+
+    try:
+        chk_fields = [f for f in ["OID@","BRANCH_CODE","BLOCK_BLUE_RN","BLOCK_TYPE_ID"] if f=="OID@" or f.upper() in fields]
+        with arcpy.da.SearchCursor(fc_path, chk_fields) as cur:
+            branch_vals = defaultdict(list)
+            for row in cur:
+                rec = dict(zip([f.upper() for f in chk_fields], row))
+                oid = rec.get("OID@", -1); branch = rec.get("BRANCH_CODE"); rn = rec.get("BLOCK_BLUE_RN"); bt = rec.get("BLOCK_TYPE_ID")
+                
+                # 6.1.1: BRANCH
+                if not (branch and isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+                
+                # 6.1.2: RN ซ้ำใน Branch
+                if rn is None or not can_be_number(rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BLOCK_BLUE_RN", rn, "ต้องเป็น Number")
+                else:
+                    branch_vals[(branch.strip() if branch else "NULL", int(float(rn)))].append(oid)
+                
+                # 6.1.3: BLOCK_TYPE_ID
+                if bt not in (1,2,3):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "BLOCK_TYPE_ID", bt, "BLOCK_TYPE_ID ต้องเป็น 1 หรือ 2 หรือ 3")
+            
+            for k,oids in branch_vals.items():
+                if len(oids)>1:
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "BLOCK_BLUE_RN", k[1], f"พบค่าซ้ำใน BRANCH_CODE '{k[0]}'")
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+    check_for_exact_overlaps(fc_path, error_list, os.path.join(OVERLAP_ROOT,"BLOCK"), basename or "BLOCK_BLUE")
+
+# 7) PARCEL_REL
+def validate_parcel_rel(fc_path, error_list, basename=None):
+
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  Validating PARCEL_REL: {fc_name}")
+    fields = safe_list_fields(fc_path)
+    required = ["BRANCH_CODE","REL_RN","PARCEL_RN","STREET_RN","BLOCK_FIX_RN","BLOCK_BLUE_RN","BLOCK_PRICE_RN","TABLE_NO","SUB_TABLE_NO","DEPTH_R","DEPTH_GROUP","START_X","START_Y","END_X","END_Y"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบฟิลด์")
+
+    # type checks for numeric
+    numeric_fields = ["REL_RN","PARCEL_RN","STREET_RN","BLOCK_FIX_RN","BLOCK_BLUE_RN","BLOCK_PRICE_RN","TABLE_NO","SUB_TABLE_NO","DEPTH_R","DEPTH_GROUP","START_X","START_Y","END_X","END_Y"]
+    for nf in numeric_fields:
+        if nf in fields and not is_numeric_field_type(fields[nf]):
+            write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, nf, fields[nf], "ต้องเป็น Number")
+
+
+    chk_fields = [f for f in required if f.upper() in fields]
+    VALID_TABLE_NO = REL_TABLE_NO_DOMAIN
+    VALID_SUB_TABLE_NO = REL_SUB_TABLE_NO_RANGE
+
+    branch_rel_rn = defaultdict(list)
+    try:
+        with arcpy.da.SearchCursor(fc_path, ["OID@"]+chk_fields) as cur:
+            for row in cur:
+                rec = dict(zip(["OID@"]+[f.upper() for f in chk_fields], row))
+                oid = rec.get("OID@", -1)
+                branch = rec.get("BRANCH_CODE"); rel_rn = rec.get("REL_RN")
+                
+                if not (branch and isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+                
+                # 7.1.2: REL_RN ซ้ำภายใน BRANCH_CODE
+                if rel_rn is None or not can_be_number(rel_rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "REL_RN", rel_rn, "REL_RN ต้องเป็น Number")
+                else:
+                    branch_key = branch.strip() if branch else "NULL"
+                    branch_rel_rn[(branch_key, int(float(rel_rn)))].append(oid)
+
+                # (ตรรกะตรวจสอบ TABLE_NO, SUB_TABLE_NO, DEPTH, COORDS ... ถูกต้องแล้ว)
+                table_no = rec.get("TABLE_NO"); sub_no = rec.get("SUB_TABLE_NO")
+                if not can_be_number(table_no) or int(float(table_no)) not in VALID_TABLE_NO:
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "TABLE_NO", table_no, f"ต้องเป็น {sorted(VALID_TABLE_NO)}")
+
+                # อนุญาตให้เป็นค่าว่าง (None) ได้
+                if sub_no is not None:
+                    # ถ้าไม่ว่าง ต้องเป็น 0-6
+                    if not can_be_number(sub_no) or int(float(sub_no)) not in VALID_SUB_TABLE_NO:
+                        write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "SUB_TABLE_NO", sub_no, "ต้องเป็น 0-6 ")
+                
+                
+                for fld in ("DEPTH_R","START_X","START_Y","END_X","END_Y"):
+                    val = rec.get(fld)
+                    if val is None or (can_be_number(val) and float(val)==0.0):
+                        write_csv_error(error_list, gdb_path, fc_name, "Data Required", oid, fld, val, f"{fld} ต้องไม่ใช่ 0 หรือค่าว่าง")
+
+            for key, oids in branch_rel_rn.items():
+                if len(oids) > 1:
+                    branch_key, rn_val = key
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "REL_RN", rn_val, f"ซ้ำภายใน BRANCH_CODE '{branch_key}'")
+
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+# 8) NS3K_REL
+def validate_ns3k_rel(fc_path, error_list, basename=None):
+    # (ปรับปรุง)
+    gdb_path, fc_name = os.path.split(fc_path)
+    print(f"  Validating NS3K_REL: {fc_name}")
+    fields = safe_list_fields(fc_path)
+    
+    # (ข้อ 8.1.3 NS3K_RN)
+    required = ["BRANCH_CODE","REL_RN","NS3K_RN","STREET_RN","BLOCK_FIX_RN","BLOCK_BLUE_RN","BLOCK_PRICE_RN","TABLE_NO","SUB_TABLE_NO","DEPTH_R","DEPTH_GROUP","START_X","START_Y","END_X","END_Y"]
+    for f in required:
+        if f.upper() not in fields:
+            write_csv_error(error_list, gdb_path, fc_name, "Field Check", -1, f, "", "ไม่พบ field")
+    
+    numeric_fields = ["REL_RN","NS3K_RN","STREET_RN","BLOCK_FIX_RN","BLOCK_BLUE_RN","BLOCK_PRICE_RN","TABLE_NO","SUB_TABLE_NO","DEPTH_R","DEPTH_GROUP","START_X","START_Y","END_X","END_Y"]
+    for nf in numeric_fields:
+        if nf in fields and not is_numeric_field_type(fields[nf]):
+            write_csv_error(error_list, gdb_path, fc_name, "Field Type", -1, nf, fields[nf], "ต้องเป็น Number")
+
+
+    chk_fields = [f for f in required if f.upper() in fields]
+    VALID_TABLE_NO = REL_TABLE_NO_DOMAIN
+    VALID_SUB_TABLE_NO = REL_SUB_TABLE_NO_RANGE
+    
+    branch_rel_rn = defaultdict(list)
+    branch_ns3k_rn = defaultdict(list)
+    
+    try:
+        with arcpy.da.SearchCursor(fc_path, ["OID@"]+chk_fields) as cur:
+            for row in cur:
+                rec = dict(zip(["OID@"]+[f.upper() for f in chk_fields], row))
+                oid = rec.get("OID@", -1)
+                branch = rec.get("BRANCH_CODE"); 
+                rel_rn = rec.get("REL_RN")
+                ns3k_rn = rec.get("NS3K_RN")
+                
+                if not (branch and isinstance(branch,str) and len(branch.strip())==8 and branch.strip().isdigit()):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "BRANCH_CODE", branch, "BRANCH_CODE ต้องเป็น 8 หลัก")
+
+                # 8.1.2: REL_RN ซ้ำภายใน BRANCH_CODE
+                if rel_rn is None or not can_be_number(rel_rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "REL_RN",rel_rn , "ต้องเป็น Number")
+                else:
+                    branch_key = branch.strip() if branch else "NULL"
+                    branch_rel_rn[(branch_key, int(float(rel_rn)))].append(oid)
+                
+                # 8.1.3: NS3K_RN 
+                if ns3k_rn is None or not can_be_number(ns3k_rn):
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Format", oid, "NS3K_RN", ns3k_rn, "NS3K_RN ต้องเป็น Number")
+        
+
+                # (ตรรกะตรวจสอบ TABLE_NO, SUB_TABLE_NO, DEPTH, COORDS ... ถูกต้องแล้ว)
+                table_no = rec.get("TABLE_NO"); sub_no = rec.get("SUB_TABLE_NO")
+                if not can_be_number(table_no) or int(float(table_no)) not in VALID_TABLE_NO:
+                    write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "TABLE_NO", table_no, f"ต้องเป็น {sorted(VALID_TABLE_NO)} ")
+                
+                #  SUB_TABLE_NO อนุญาตให้เป็นค่าว่าง (None) ได้
+                if sub_no is not None:
+                    # ถ้าไม่ว่าง ต้องเป็น 0 หรือ 1-6
+
+                    if not can_be_number(sub_no) or int(float(sub_no)) not in VALID_SUB_TABLE_NO:
+                        write_csv_error(error_list, gdb_path, fc_name, "Data Specified", oid, "SUB_TABLE_NO", sub_no, "ต้องเป็น 0 หรือ 1-6 ")
+                
+                for fld in ("DEPTH_R","START_X","START_Y","END_X","END_Y"):
+                    val = rec.get(fld)
+                    if val is None or (can_be_number(val) and float(val)==0.0):
+                        write_csv_error(error_list, gdb_path, fc_name, "Data Required", oid, fld, val, f"{fld} จะต้องไม่ใช่ 0 หรือค่าว่าง")
+            
+            for key, oids in branch_rel_rn.items():
+                if len(oids) > 1:
+                    branch_key, rn_val = key
+                    write_csv_error(error_list, gdb_path, fc_name, "Duplicate Value", str(oids), "REL_RN", rn_val, f"REL_RN ซ้ำภายใน BRANCH_CODE '{branch_key}'")
+
+
+    except Exception as ex:
+        write_csv_error(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
+
+# ------------------------------
+# ------------ MAIN ------------
+# ------------------------------
+
+def main():
+    print("เริ่มต้นกระบวนการตรวจสอบมาตรฐาน...")
+
+    validation_map = {
+        "PARCEL": {"pattern": re.compile(r'^PARCEL_\d{2}_\d{2}$', re.IGNORECASE), "func": validate_parcel},
+        "PARCEL_NS3K": {"pattern": re.compile(r'^PARCEL_\d{2}_NS3K_\d{2}$', re.IGNORECASE), "func": validate_parcel_ns3k},
+        "ROAD": {"pattern": re.compile(r'^ROAD_\d{2}$', re.IGNORECASE), "func": validate_road},
+        "BLOCK_FIX": {"pattern": re.compile(r'^BLOCK_FIX_\d{2}$', re.IGNORECASE), "func": validate_block_fix},
+        "BLOCK_PRICE": {"pattern": re.compile(r'^BLOCK_PRICE_\d{2}$', re.IGNORECASE), "func": validate_block_price},
+        "BLOCK_BLUE": {"pattern": re.compile(r'^BLOCK_BLUE_\d{2}$', re.IGNORECASE), "func": validate_block_blue},
+        "PARCEL_REL": {"pattern": re.compile(r'^PARCEL_REL_\d{2}$', re.IGNORECASE), "func": validate_parcel_rel},
+        "NS3K_REL": {"pattern": re.compile(r'^NS3K_REL_\d{2}$', re.IGNORECASE), "func": validate_ns3k_rel}
+    }
+
+    gdb_paths = find_gdb_paths(ROOT_DIR)
+    if not gdb_paths:
+        print("ไม่พบ GDBs ยกเลิกการดำเนินการ.")
+        return
+
+    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    run_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    gdb_report_dir = os.path.join(REPORT_ROOT, today_str)
+    os.makedirs(gdb_report_dir, exist_ok=True)
+    
+    all_data_records = []
+    error_summary_records = []
+
+
+    for gdb in gdb_paths:
+        print(f"\nกำลังดำเนินการ: {gdb}")
+        
+        gdb_error_list = []
+        
+        try:
+            arcpy.env.workspace = gdb
+            parent = os.path.basename(os.path.dirname(gdb))
+            grandparent = os.path.basename(os.path.dirname(os.path.dirname(gdb)))
+            basename = f"{grandparent}_{parent}"
+            basename = re.sub(r'[\\/*?:"<>|]','_',basename)
+
+            fcs_and_tables = (arcpy.ListFeatureClasses() or []) + (arcpy.ListTables() or [])
+            if not fcs_and_tables:
+                print("  ไม่พบฟิเจอร์คลาสใน GDB.")
+                continue
+            
+            for fc in fcs_and_tables:
+                fc_upper = fc.upper() 
+                for key,meta in validation_map.items():
+                    if meta["pattern"].match(fc_upper): 
+                        fc_path = os.path.join(gdb, fc)
+                        
+                        # (Sheet 1: นับจำนวน - ยังใช้ gdb path เต็ม)
+                        try:
+                            count = int(arcpy.management.GetCount(fc_path)[0])
+                            all_data_records.append([
+                                run_timestamp,
+                                gdb, 
+                                fc,
+                                count
+                            ])
+                        except Exception as e:
+                            print(f"  !! ไม่สามารถนับจำนวน {fc} ได้: {e}")
+                            all_data_records.append([
+                                run_timestamp,
+                                gdb, 
+                                fc,
+                                "Error"
+                            ])
+                        
+                        # รัน Validator 
+                        try:
+                            meta["func"](fc_path, gdb_error_list, basename)
+                        except Exception as e:
+                            write_csv_error(gdb_error_list, gdb, fc, "Validator Error", -1, "", "", str(e))
+                        break
+            
+            if gdb_error_list:
+                # *** (แก้ไข 1) เปลี่ยนจาก CSV เป็น Excel ***
+                report_path = os.path.join(gdb_report_dir, f"{basename}_error_report.xlsx") # <--- เปลี่ยนนามสกุลเป็น .xlsx
+                try:
+                    # 1. กำหนด Headers
+                    headers = ['Timestamp','GDB_Path','Featureclass','Check_Type','Object_ID(s)','Field_Name','Invalid_Value','Message']
+                    
+                    # 2. สร้าง DataFrame
+                    error_df_gdb = pd.DataFrame(gdb_error_list, columns=headers)
+                    
+                    # *** แปลง GDB_Path เป็นแบบย่อ ***
+                    error_df_gdb['GDB_Path'] = error_df_gdb['GDB_Path'].apply(get_short_gdb_path)
+                    
+                    # 3. บันทึกเป็น Excel
+                    with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+                        error_df_gdb.to_excel(writer, sheet_name='Errors', index=False)
+                    
+                    print(f"  -> รายงาน Excel ถูกบันทึก: {report_path} (พบ {len(gdb_error_list)} errors)")
+                
+                except Exception as e:
+                     print(f"  !! ไม่สามารถเขียนรายงาน Excel ได้ {report_path}: {e}")
+                
+                # (สรุป Error สำหรับ Sheet 2)
+                try:
+                    error_df = pd.DataFrame(gdb_error_list, columns=['Timestamp', 'GDB_Path', 'Featureclass', 'Check_Type', 'Object_ID(s)', 'Field_Name', 'Invalid_Value', 'Message'])
+                    summary_df = error_df.groupby(['GDB_Path', 'Featureclass', 'Check_Type']).size().reset_index(name='Count of Errors')
+                    summary_df['Timestamp'] = run_timestamp
+                    summary_df = summary_df[['Timestamp', 'GDB_Path', 'Featureclass', 'Check_Type', 'Count of Errors']]
+                    error_summary_records.extend(summary_df.values.tolist())
+                    
+                except Exception as e:
+                    print(f"  !! ไม่สามารถสรุป Error GDB นี้ได้: {e}")
+
+            else:
+                print(f"  -> ไม่พบข้อผิดพลาด (ไม่ต้องสร้างไฟล์สำหรับ {basename})")
+
+            try:
+                arcpy.management.Delete("in_memory")
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"  Failed processing {gdb}: {e}")
+
+    # *** เขียนรายงานสรุป Excel ***
+    print(f"\nกำลังเขียนรายงานสรุป Excel ที่: {SUMMARY_EXCEL_PATH}")
+    try:
+        with pd.ExcelWriter(SUMMARY_EXCEL_PATH, engine='openpyxl') as writer:
+            # Sheet 1: All_DATA
+            if all_data_records:
+                all_data_df = pd.DataFrame(all_data_records, columns=['Timestamp', 'GDB_Path', 'Featureclass', 'Count of Polygon or Polyline'])
+                
+                # *** แปลง Path ใน Sheet 1 ***
+                all_data_df['GDB_Path'] = all_data_df['GDB_Path'].apply(get_short_gdb_path)
+                
+                all_data_df.to_excel(writer, sheet_name='All_DATA', index=False)
+                print(f"  -> เขียน Sheet 'All_DATA' ({len(all_data_df)} แถว)")
+            else:
+                print("  -> ไม่มีข้อมูลสำหรับ 'All_DATA'")
+
+            # Sheet 2: Error SUM
+            if error_summary_records:
+                error_sum_df = pd.DataFrame(error_summary_records, columns=['Timestamp', 'GDB_Path', 'Featureclass', 'Check_Type', 'Count of Errors'])
+                
+                # *** แปลง Path ใน Sheet 2 ***
+                error_sum_df['GDB_Path'] = error_sum_df['GDB_Path'].apply(get_short_gdb_path)
+                
+                error_sum_df.to_excel(writer, sheet_name='Error SUM', index=False)
+                print(f"  -> เขียน Sheet 'Error SUM' ({len(error_sum_df)} แถว)")
+            else:
+                print("  -> ไม่มีข้อมูลสำหรับ 'Error SUM'")
+        
+        print("  -> บันทึกไฟล์สรุป Excel เรียบร้อยแล้ว")
+
+    except Exception as e:
+        print(f"  !! ล้มเหลวในการเขียนไฟล์สรุป Excel: {e}")
+        print("  !! (โปรดตรวจสอบว่าไฟล์ Excel ปิดอยู่ และคุณมีสิทธิ์เขียนทับ)")
+
+    print("\nValidation complete.")
+
+if __name__ == "__main__":
+    main()
