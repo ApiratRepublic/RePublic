@@ -1,26 +1,27 @@
 # =============================================================================
 # - รันบน ArcGIS Pro Python environment (ต้องมี arcpy)
-# - Script v3 (ปรับปรุง 2025-10-28)
+# - Script เผยแพร่ v1 
+# - date: 2025-10-29)
 # - ตรวจสอบความถูกต้องของข้อมูล GIS ใน GDB ตามมาตรฐานที่กำหนด
 # =============================================================================
 
 import arcpy
 import os
 import re
-import csv
 import datetime
 import uuid
 from collections import defaultdict
 import pandas as pd
 from openpyxl import load_workbook
 
+
 ###############################################
 #----------------- ที่ตั้งไฟล์
 ###############################################
-ROOT_DIR = r"D:\A02-Projects\Clinix\Test_GDB_GPT"  # ที่รวมไฟล์ GDB
-REPORT_ROOT = r"D:\A02-Projects\Clinix\Report"  # ที่เก็บรายงานผล
-OVERLAP_ROOT = r"D:\A02-Projects\Clinix\Overlaping"  # ที่เก็บไฟล์ผลการตรวจสอบทับซ้อน
-SUMMARY_EXCEL_PATH = r"D:\A02-Projects\Clinix\Report\Summary_Report.xlsx"
+ROOT_DIR = r"D:\A02-Projects\WarRoom\GDB"  # ที่รวมไฟล์ GDB
+REPORT_ROOT = r"D:\A02-Projects\WarRoom\Reportalt"  # ที่เก็บรายงานผล
+OVERLAP_ROOT = r"D:\A02-Projects\WarRoom\Overlapingalt"  # ที่เก็บไฟล์ผลการตรวจสอบทับซ้อน
+SUMMARY_SUMMARY_EXCEL_PATH = os.path.join(REPORT_ROOT,"Summary_Report.xlsx") # ไฟล์สรุปรายงานรวม
 # --------------------------------------------
 #   จัดการค่าต่าง ๆ รวมทั้งฟังก์ชัน ตัวแปร ที่ใช้ร่วมกัน
 # --------------------------------------------
@@ -96,6 +97,47 @@ def get_short_gdb_path(full_gdb_path):
     except Exception:
         return full_gdb_path # ถ้ามีปัญหา ให้คืนค่าเดิม
     
+def extract_province(gdb_path_str):
+    """
+    (ฟังก์ชันใหม่) ดึงชื่อจังหวัดจาก GDB_Path
+    ตัวอย่าง: "36-ชัยภูมิ\GDB_36_1" -> "ชัยภูมิ"
+    ตัวอย่าง: "49_มุกดาหาร\GDB_49_2" -> "มุกดาหาร"
+    ตัวอย่าง: "10_1-กรุงเทพมหานคร1\GDB_10_1" -> "กรุงเทพมหานคร1"
+    """
+    try:
+        # Regex นี้จะหา (ตัวเลข/ขีดล่าง) + (ขีดกลาง/ขีดล่าง) + (ดึงชื่อจังหวัด) + (เครื่องหมาย \)
+        match = re.search(r"^\d+[\d_]*[-_](.*?)\\", str(gdb_path_str))
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return "Unknown" # คืนค่าเริ่มต้นหากไม่พบ
+
+def categorize_featureclass(fc_name_str):
+    """
+    (ฟังก์ชันใหม่) จัดกลุ่ม Featureclass เป็น Category หลัก
+    """
+    fc = str(fc_name_str).upper()
+    if re.match(r"^PARCEL_\d+_\d+$", fc):
+        return "PARCEL"
+    elif re.match(r"^PARCEL_\d+_NS3K_\d+$", fc):
+        return "NS3K"
+    elif re.match(r"^ROAD_\d+$", fc):
+        return "ROAD"
+    elif re.match(r"^BLOCK_FIX_\d+$", fc):
+        return "BLOCK_FIX"
+    elif re.match(r"^BLOCK_PRICE_\d+$", fc):
+        return "BLOCK_PRICE"
+    elif re.match(r"^BLOCK_BLUE_\d+$", fc):
+        return "BLOCK_BLUE"
+    elif re.match(r"^PARCEL_REL_\d+$", fc):
+        return "PARCEL_REL"
+    elif re.match(r"^NS3K_REL_\d+$", fc):
+        return "NS3K_REL"
+    else:
+        return None # ไม่ตรงกับกลุ่มใด
+
+# ฟังก์ชันช่วยอ่านฟิลด์อย่างปลอดภัย
 def safe_list_fields(fc_path):
     try:
         return {f.name.upper(): f.type for f in arcpy.ListFields(fc_path)}
@@ -162,9 +204,24 @@ def check_for_exact_overlaps(fc_path, error_list, output_dir, output_basename, r
 
     gdb_path, fc_name = os.path.split(fc_path)
     uid = uuid.uuid4().hex[:8]
-    out_table = os.path.join("in_memory", f"ident_{output_basename}_{uid}")
-    temp_layer = f"in_memory_dup_lyr_{uid}"
+
+    # 1. ล้างชื่อ basename สำหรับใช้ใน in_memory (ลบอักขระพิเศษและภาษาไทย)
+    #    แทนที่ทุกอย่างที่ไม่ใช่ A-Z, a-z, 0-9, หรือ _ ด้วย _
+    safe_basename_for_mem = re.sub(r'[^A-Za-z0-9_]', '_', output_basename)
+    
+    # 2. ตรวจสอบว่าชื่อเริ่มต้นด้วยตัวอักษร (ข้อกำหนดของ in_memory)
+    if not safe_basename_for_mem[0].isalpha():
+        safe_basename_for_mem = "GDB_" + safe_basename_for_mem
+        
+    # 3. ใช้ชื่อที่ปลอดภัย (safe_basename_for_mem) สำหรับ in_memory
+    out_table = os.path.join("in_memory", f"ident_{safe_basename_for_mem}_{uid}")
+    temp_layer = f"in_memory_dup_lyr_{safe_basename_for_mem}_{uid}"
+    
+    # 4. (สำคัญ) ยังคงใช้ output_basename (ชื่อเดิมที่มีภาษาไทย) สำหรับ .shp
     output_shp = os.path.join(output_dir, f"{output_basename}_{fc_name}_duplicates.shp")
+    # ----------------------------------------------------
+
+    # ----------------------------------------------------
 
     # --------------------------
     # ฟังก์ชันช่วยลบข้อมูลอย่างปลอดภัย
@@ -1110,9 +1167,9 @@ def validate_ns3k_rel(fc_path, error_list, basename=None):
     except Exception as ex:
         write_error_report(error_list, gdb_path, fc_name, "Cursor Error", -1, "", "", str(ex))
 
-# ------------------------------
-# ------------ MAIN ------------
-# ------------------------------
+################################################
+# --------------- MAIN
+################################################
 
 def main():
     print("เริ่มต้นกระบวนการตรวจสอบมาตรฐาน...")
@@ -1139,6 +1196,7 @@ def main():
     gdb_report_dir = os.path.join(REPORT_ROOT, today_str)
     os.makedirs(gdb_report_dir, exist_ok=True)
     
+    ### ส่วนการวนลูป GDBs และรัน Validator
     all_data_records = []
     error_summary_records = []
 
@@ -1153,7 +1211,12 @@ def main():
             parent = os.path.basename(os.path.dirname(gdb))
             grandparent = os.path.basename(os.path.dirname(os.path.dirname(gdb)))
             basename = f"{grandparent}_{parent}"
-            basename = re.sub(r'[\\/*?:"<>|]','_',basename)
+           
+            #basename = re.sub(r'[\\/*?:"<>|]','_',basename)
+            # (ส่วนการล้าง basename สำหรับ in_memory ... ไม่เปลี่ยนแปลง)
+            basename_for_mem = re.sub(r'[^A-Za-z0-9_]', '_', basename)
+            if not basename_for_mem[0].isalpha():
+                basename_for_mem = "GDB_" + basename_for_mem
 
             fcs_and_tables = (arcpy.ListFeatureClasses() or []) + (arcpy.ListTables() or [])
             if not fcs_and_tables:
@@ -1236,9 +1299,9 @@ def main():
             print(f"  Failed processing {gdb}: {e}")
 
     # *** เขียนรายงานสรุป Excel ***
-    print(f"\nกำลังเขียนรายงานสรุป Excel ที่: {SUMMARY_EXCEL_PATH}")
+    print(f"\nกำลังเขียนรายงานสรุป Excel ที่: {SUMMARY_SUMMARY_EXCEL_PATH}")
     try:
-        with pd.ExcelWriter(SUMMARY_EXCEL_PATH, engine='openpyxl') as writer:
+        with pd.ExcelWriter(SUMMARY_SUMMARY_EXCEL_PATH, engine='openpyxl') as writer:
             # Sheet 1: All_DATA
             if all_data_records:
                 all_data_df = pd.DataFrame(all_data_records, columns=['Timestamp', 'GDB_Path', 'Featureclass', 'Count of Polygon or Polyline'])
@@ -1260,9 +1323,49 @@ def main():
                 
                 error_sum_df.to_excel(writer, sheet_name='Error SUM', index=False)
                 print(f"  -> เขียน Sheet 'Error SUM' ({len(error_sum_df)} แถว)")
+                # -------------------------------------------------
+                # *** (ส่วนที่เพิ่มใหม่) สร้าง Sheet 3: Report_by_Province ***
+                # -------------------------------------------------
+                try:
+                    # 1. ใช้ DataFrame (df) จาก Sheet 2
+                    # (เรา copy() เพื่อป้องกัน SettingWithCopyWarning)
+                    df_report = error_sum_df.copy()
+
+                    # 2. (ข้อ 1) สร้างคอลัมน์ "Province"
+                    df_report["Province"] = df_report["GDB_Path"].apply(extract_province)
+
+                    # 3. (ข้อ 2) สร้างคอลัมน์ "Category"
+                    df_report["Category"] = df_report["Featureclass"].apply(categorize_featureclass)
+                    
+                    # 4. ลบแถวที่ไม่ใช่ Category ที่เราสนใจ (ถ้ามี)
+                    df_report = df_report.dropna(subset=["Category"])
+
+                    # 5. Group by และ Sum
+                    # เราจะรวม error ทั้งหมด โดยนับตาม "Province" และ "Category"
+                    grouped_df = df_report.groupby(["Province", "Category"])["Count of Errors"].sum().reset_index()
+
+                    # 6. Pivot ตารางให้อ่านง่าย
+                    # แถว = Province
+                    # คอลัมน์ = Category
+                    # ค่า = Count of Errors
+                    pivot_df = grouped_df.pivot(
+                        index="Province", 
+                        columns="Category", 
+                        values="Count of Errors"
+                    ).fillna(0).astype(int) # เติม 0 ในช่องที่ไม่มี error
+
+                    # 7. บันทึกลง Sheet ใหม่
+                    pivot_df.to_excel(writer, sheet_name='Report_by_Province', index=True) # index=True เพื่อเก็บชื่อจังหวัด
+                    print(f"  -> เขียน Sheet 'Report_by_Province' ({len(pivot_df)} แถว)")
+
+                except Exception as e:
+                    print(f"  !! ล้มเหลวในการสร้าง Sheet 'Report_by_Province': {e}")
+                # -------------------------------------------------
+                # *** (สิ้นสุดส่วนที่เพิ่มใหม่) ***
+                # -------------------------------------------------
             else:
                 print("  -> ไม่มีข้อมูลสำหรับ 'Error SUM'")
-        
+
         print("  -> บันทึกไฟล์สรุป Excel เรียบร้อยแล้ว")
 
     except Exception as e:
@@ -1273,3 +1376,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+######################################################
+############### END ALL ##############################
