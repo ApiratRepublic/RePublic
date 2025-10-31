@@ -1,6 +1,6 @@
 ## Introduction
 This repository is for my  PSVD friends
-(Psychosis Sanctified of Voiceless Despair)
+(Psychosis Sanctified of Voiceless Desperado)
 
 ## What the project does
 รวบรวมไพธอนสคริปต์ที่ใช้ในการบริหารจัดการด้าน GIS 
